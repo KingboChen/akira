@@ -66,11 +66,6 @@ jobs:
           echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
           echo "PATCH_PATH=$PATCH_PATH" >> "$GITHUB_ENV"
 
-          if ! git diff --cached --quiet; then
-            git commit -m "Sync upstream master (${UPSTREAM_SHA::7}) [skip ci]"
-            git push origin HEAD:master
-          fi
-
       - name: Check for an existing release
         id: release-check
         shell: bash
