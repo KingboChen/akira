@@ -68,10 +68,10 @@ index 7cbe5c3016173dce90fd3264200f0c795f897b9a..55a349bd23ec91937ad786ae5135ede5
      std::string lastError;
 diff --git a/source/core/net/wireguard_endpoint.cpp b/source/core/net/wireguard_endpoint.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..dbb6ec7e80dc824de440f4aa9c4be29b7beb7b5c
+index 0000000000000000000000000000000000000000..d92d19ba2d8e712be0a4943cc38664dae9dce49a
 --- /dev/null
 +++ b/source/core/net/wireguard_endpoint.cpp
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,361 @@
 +#include "core/net/wireguard_endpoint.hpp"
 +
 +#include <algorithm>
@@ -211,15 +211,18 @@ index 0000000000000000000000000000000000000000..dbb6ec7e80dc824de440f4aa9c4be29b
 +        return std::nullopt;
 +    const std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(raw, &freeaddrinfo);
 +
++    std::vector<DnsAaaaAddress> answers;
 +    for (const addrinfo* entry = raw; entry; entry = entry->ai_next)
 +    {
 +        if (entry->ai_family != AF_INET6 || entry->ai_addrlen < sizeof(sockaddr_in6))
 +            continue;
 +        const auto* address = reinterpret_cast<const sockaddr_in6*>(entry->ai_addr);
-+        if (auto decoded = decodeIp4p(address->sin6_addr))
-+            return decoded;
++        DnsAaaaAddress answer = {};
++        static_assert(sizeof(address->sin6_addr.s6_addr) == sizeof(answer));
++        std::memcpy(answer.data(), address->sin6_addr.s6_addr, sizeof(answer));
++        answers.push_back(answer);
 +    }
-+    return std::nullopt;
++    return decodeIp4pAnswers(answers);
 +}
 +#else
 +std::optional<std::vector<DnsAaaaAddress>> queryDnsServer(
