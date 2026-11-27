@@ -77,8 +77,8 @@ index 987a8dd1dbb5..57a6797750f3 100644
      allowedIps = std::move(allowed);
      brls::Logger::info("WG: parseConfigFile completed successfully");
 @@ -241,7 +241,7 @@
-         return false;
-     }
+             return false;
+         }
  
 -        if (!configLoaded) {
 +        if (!configLoaded || configHasIp4p) {
