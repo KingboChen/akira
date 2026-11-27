@@ -87,6 +87,7 @@ jobs:
         run: |
           set -euo pipefail
           git apply --3way "$PATCH_PATH"
+          git config --global url."https://github.com/".insteadOf git@github.com:
           git submodule sync --recursive
           git submodule update --init --recursive
 
