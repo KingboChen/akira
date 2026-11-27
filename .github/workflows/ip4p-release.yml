@@ -55,6 +55,7 @@ jobs:
           TOKEN_BASE64=${AUTH_HEADER##* }
           GH_TOKEN=$(printf '%s' "$TOKEN_BASE64" | base64 --decode | cut -d: -f2-)
           echo "GH_TOKEN=$GH_TOKEN" >> "$GITHUB_ENV"
+          echo "GH_REPO=$GITHUB_REPOSITORY" >> "$GITHUB_ENV"
 
           UPSTREAM_SHA=$(git rev-parse upstream/master)
           PATCH_BLOB=$(git rev-parse "$AUTOMATION_SHA:$PATCH_PATH")
