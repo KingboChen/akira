@@ -1,0 +1,389 @@
+diff --git a/source/core/wireguard_manager.cpp b/source/core/wireguard_manager.cpp
+index 987a8dd1dbb5..57a6797750f3 100644
+--- a/source/core/wireguard_manager.cpp
++++ b/source/core/wireguard_manager.cpp
+@@ -2,6 +2,7 @@
+ #include "core/settings_manager.hpp"
+ #include "core/chiaki_core.hpp"
+ #include "core/net/tunnel_stack.hpp"
++#include "core/net/wireguard_endpoint.hpp"
+ #include <algorithm>
+ #include <array>
+ #include <format>
+@@ -63,7 +64,6 @@
+     std::string line;
+     std::string section;
+     std::string privateKey, publicKey, endpoint, address, presharedKey;
+-    uint16_t port = 51820;
+     uint16_t keepalive = 25;
+     uint16_t mtu = WG_DEFAULT_MTU;
+     std::vector<akira::net::RoutingNetworkProvider::Prefix> allowed;
+@@ -118,18 +118,8 @@
+             publicKey = parseValue(line);
+             brls::Logger::info("WG: found PublicKey");
+         } else if (line.find("Endpoint") != std::string::npos) {
+-            std::string ep = parseValue(line);
+-            brls::Logger::info("WG: found Endpoint: {}", ep);
+-            size_t colonPos = ep.rfind(':');
+-            if (colonPos != std::string::npos) {
+-                endpoint = ep.substr(0, colonPos);
+-                std::string portStr = ep.substr(colonPos + 1);
+-                brls::Logger::info("WG: parsing port: {}", portStr);
+-                port = static_cast<uint16_t>(std::stoi(portStr));
+-            } else {
+-                endpoint = ep;
+-            }
+-            brls::Logger::info("WG: endpoint={} port={}", endpoint, port);
++            endpoint = parseValue(line);
++            brls::Logger::info("WG: found Endpoint: {}", endpoint);
+         } else if (line.find("Address") != std::string::npos) {
+             address = parseValue(line);
+             brls::Logger::info("WG: found Address: {}", address);
+@@ -172,6 +162,15 @@
+         return false;
+     }
+ 
++    auto parsedEndpoint = akira::net::parseWireGuardEndpoint(endpoint);
++    if (!parsedEndpoint) {
++        lastError = "Invalid Endpoint format";
++        brls::Logger::error("WG: {}", lastError);
++        return false;
++    }
++    if (parsedEndpoint->fromIp4p)
++        brls::Logger::info("WG: resolved IP4P endpoint to {}:{}", parsedEndpoint->host, parsedEndpoint->port);
++
+     brls::Logger::info("WG: decoding private key");
+     if (wg_key_from_base64(cfg.private_key, privateKey.c_str()) != 0) {
+         lastError = "Invalid PrivateKey format";
+@@ -192,9 +191,9 @@
+         return false;
+     }
+ 
+-    brls::Logger::info("WG: setting endpoint host: {}", endpoint);
+-    strncpy(cfg.endpoint_host, endpoint.c_str(), sizeof(cfg.endpoint_host) - 1);
+-    cfg.endpoint_port = port;
++    brls::Logger::info("WG: setting endpoint host: {}", parsedEndpoint->host);
++    strncpy(cfg.endpoint_host, parsedEndpoint->host.c_str(), sizeof(cfg.endpoint_host) - 1);
++    cfg.endpoint_port = parsedEndpoint->port;
+     cfg.keepalive_interval = keepalive;
+     cfg.mtu = mtu;
+     if (!presharedKey.empty()) {
+@@ -209,6 +208,7 @@
+         cfg.has_preshared_key = 0;
+     }
+ 
++    configHasIp4p = parsedEndpoint->fromIp4p;
+     tunnelIP = address;
+     allowedIps = std::move(allowed);
+     brls::Logger::info("WG: parseConfigFile completed successfully");
+@@ -241,7 +241,7 @@
+         return false;
+     }
+ 
+-        if (!configLoaded) {
++        if (!configLoaded || configHasIp4p) {
+             brls::Logger::info("WG: parsing config file");
+             if (!parseConfigFile(CONFIG_PATH, config)) {
+                 brls::Logger::error("WG: parseConfigFile failed: {}", lastError);
+diff --git a/include/core/wireguard_manager.hpp b/include/core/wireguard_manager.hpp
+index 7cbe5c301617..55a349bd23ec 100644
+--- a/include/core/wireguard_manager.hpp
++++ b/include/core/wireguard_manager.hpp
+@@ -47,6 +47,7 @@
+     WgTunnel* tunnel = nullptr;
+     WgConfig config = {};
+     bool configLoaded = false;
++    bool configHasIp4p = false;
+     bool connecting = false;
+     std::atomic<bool> connected{false};
+     std::string lastError;
+diff --git a/website/docs/advanced/wireguard.md b/website/docs/advanced/wireguard.md
+index 6481beef1d5f..4d6a18a81576 100644
+--- a/website/docs/advanced/wireguard.md
++++ b/website/docs/advanced/wireguard.md
+@@ -47,8 +47,24 @@
+ PersistentKeepalive = 30
+ ```
+ 
++### IP4P endpoints
++
++If your WireGuard server uses NATMap, akira can resolve an [IP4P address](https://github.com/heiher/natmap#ip4p-address) instead of a regular hostname and port. Publish the IP4P value as the domain's AAAA record and omit the port from `Endpoint`:
++
++```ini
++Endpoint = ip4p.example.com
++```
++
++You can also enter the IP4P IPv6 literal directly:
++
++```ini
++Endpoint = 2001::0355:0101:0101
++```
++
++The example above connects to `1.1.1.1:853`. IP4P domains are resolved again on every connection so updated NAT mappings are picked up. Regular `host:port` endpoints are unchanged.
++
+ :::warning
+-You have to be externally reachable and not behind CGNAT.
++When not using IP4P or another NAT mapping, you have to be externally reachable and not behind CGNAT.
+ :::
+ 
+ Your mileage will vary. This is an early release and still jitters, so it's capped to 720p at a max of 15k bitrate. In my tests the actual bitrate negotiated with the PS5 never got past 6k.
+diff --git a/include/core/net/wireguard_endpoint.hpp b/include/core/net/wireguard_endpoint.hpp
+new file mode 100644
+--- /dev/null
++++ b/include/core/net/wireguard_endpoint.hpp
+@@ -0,0 +1,27 @@
++#ifndef AKIRA_WIREGUARD_ENDPOINT_HPP
++#define AKIRA_WIREGUARD_ENDPOINT_HPP
++
++#include <cstdint>
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace akira::net {
++
++struct WireGuardEndpoint {
++    std::string host;
++    std::uint16_t port = 51820;
++    bool fromIp4p = false;
++};
++
++// Decode the NATMap IP4P form: 2001::{port}:{ipv4-hi16}:{ipv4-lo16}.
++std::optional<WireGuardEndpoint> parseIp4pEndpoint(std::string_view value);
++
++// Parse a regular WireGuard endpoint or resolve an IP4P AAAA record when no
++// explicit port is present. Regular endpoints retain the historical default
++// port of 51820.
++std::optional<WireGuardEndpoint> parseWireGuardEndpoint(std::string_view value);
++
++} // namespace akira::net
++
++#endif // AKIRA_WIREGUARD_ENDPOINT_HPP
+diff --git a/source/core/net/wireguard_endpoint.cpp b/source/core/net/wireguard_endpoint.cpp
+new file mode 100644
+--- /dev/null
++++ b/source/core/net/wireguard_endpoint.cpp
+@@ -0,0 +1,138 @@
++#include "core/net/wireguard_endpoint.hpp"
++
++#include <algorithm>
++#include <arpa/inet.h>
++#include <array>
++#include <charconv>
++#include <memory>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++
++namespace akira::net {
++namespace {
++
++std::string_view trimmed(std::string_view value)
++{
++    constexpr std::string_view whitespace = " \t\r\n";
++    const auto first = value.find_first_not_of(whitespace);
++    if (first == std::string_view::npos)
++        return {};
++    const auto last = value.find_last_not_of(whitespace);
++    return value.substr(first, last - first + 1);
++}
++
++std::optional<std::uint16_t> parsePort(std::string_view value)
++{
++    unsigned int port = 0;
++    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), port);
++    if (value.empty() || error != std::errc{} || end != value.data() + value.size() || port == 0 || port > 65535)
++        return std::nullopt;
++    return static_cast<std::uint16_t>(port);
++}
++
++std::optional<WireGuardEndpoint> decodeIp4p(const in6_addr& address)
++{
++    // The fixed 2001::/80 prefix leaves 16 bits for the port and 32 for IPv4.
++    static constexpr std::array<unsigned char, 10> prefix{0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0};
++    if (!std::equal(prefix.begin(), prefix.end(), address.s6_addr))
++        return std::nullopt;
++
++    const auto port = static_cast<std::uint16_t>(
++        (static_cast<std::uint16_t>(address.s6_addr[10]) << 8) | address.s6_addr[11]);
++    if (port == 0)
++        return std::nullopt;
++
++    char host[INET_ADDRSTRLEN] = {};
++    if (!inet_ntop(AF_INET, address.s6_addr + 12, host, sizeof(host)))
++        return std::nullopt;
++    return WireGuardEndpoint{host, port, true};
++}
++
++std::optional<WireGuardEndpoint> resolveIp4p(const std::string& hostname)
++{
++    addrinfo hints = {};
++    hints.ai_family = AF_INET6;
++    hints.ai_socktype = SOCK_DGRAM;
++    hints.ai_protocol = IPPROTO_UDP;
++
++    addrinfo* raw = nullptr;
++    if (getaddrinfo(hostname.c_str(), nullptr, &hints, &raw) != 0)
++        return std::nullopt;
++    const std::unique_ptr<addrinfo, decltype(&freeaddrinfo)> addresses(raw, &freeaddrinfo);
++
++    for (const addrinfo* entry = raw; entry; entry = entry->ai_next)
++    {
++        if (entry->ai_family != AF_INET6 || entry->ai_addrlen < sizeof(sockaddr_in6))
++            continue;
++        const auto* address = reinterpret_cast<const sockaddr_in6*>(entry->ai_addr);
++        if (auto decoded = decodeIp4p(address->sin6_addr))
++            return decoded;
++    }
++    return std::nullopt;
++}
++
++} // namespace
++
++std::optional<WireGuardEndpoint> parseIp4pEndpoint(std::string_view value)
++{
++    std::string text(trimmed(value));
++    if (text.size() >= 2 && text.front() == '[' && text.back() == ']')
++        text = text.substr(1, text.size() - 2);
++
++    in6_addr address = {};
++    if (inet_pton(AF_INET6, text.c_str(), &address) != 1)
++        return std::nullopt;
++    return decodeIp4p(address);
++}
++
++std::optional<WireGuardEndpoint> parseWireGuardEndpoint(std::string_view value)
++{
++    const std::string_view endpoint = trimmed(value);
++    if (endpoint.empty())
++        return std::nullopt;
++
++    if (endpoint.front() == '[')
++    {
++        const auto close = endpoint.find(']');
++        if (close == std::string_view::npos || close == 1)
++            return std::nullopt;
++        const std::string host(endpoint.substr(1, close - 1));
++        const std::string_view suffix = trimmed(endpoint.substr(close + 1));
++        if (suffix.empty())
++        {
++            if (auto ip4p = parseIp4pEndpoint(host))
++                return ip4p;
++            return WireGuardEndpoint{host, 51820, false};
++        }
++        if (suffix.front() != ':')
++            return std::nullopt;
++        const auto port = parsePort(trimmed(suffix.substr(1)));
++        if (!port)
++            return std::nullopt;
++        return WireGuardEndpoint{host, *port, false};
++    }
++
++    if (auto ip4p = parseIp4pEndpoint(endpoint))
++        return ip4p;
++
++    const auto colons = static_cast<std::size_t>(std::count(endpoint.begin(), endpoint.end(), ':'));
++    if (colons > 1)
++        return std::nullopt; // Non-IP4P IPv6 literals must use [address]:port.
++    if (colons == 1)
++    {
++        const auto separator = endpoint.rfind(':');
++        const std::string host(endpoint.substr(0, separator));
++        const auto port = parsePort(trimmed(endpoint.substr(separator + 1)));
++        if (host.empty() || !port)
++            return std::nullopt;
++        return WireGuardEndpoint{host, *port, false};
++    }
++
++    const std::string host(endpoint);
++    if (auto ip4p = resolveIp4p(host))
++        return ip4p;
++    return WireGuardEndpoint{host, 51820, false};
++}
++
++} // namespace akira::net
+diff --git a/tests/test_wireguard_endpoint.cpp b/tests/test_wireguard_endpoint.cpp
+new file mode 100644
+--- /dev/null
++++ b/tests/test_wireguard_endpoint.cpp
+@@ -0,0 +1,69 @@
++#include "test_util.hpp"
++
++#include "core/net/wireguard_endpoint.hpp"
++
++#include <cstdint>
++#include <string>
++
++using akira::net::parseIp4pEndpoint;
++using akira::net::parseWireGuardEndpoint;
++
++TEST(ip4p_decodes_natmap_example)
++{
++    const auto endpoint = parseIp4pEndpoint("2001::0355:0101:0101");
++    REQUIRE(endpoint.has_value());
++    CHECK_EQ(endpoint->host, std::string("1.1.1.1"));
++    CHECK_EQ(endpoint->port, std::uint16_t{853});
++    CHECK(endpoint->fromIp4p);
++}
++
++TEST(ip4p_accepts_bracketed_literal_and_maximum_values)
++{
++    const auto bracketed = parseWireGuardEndpoint("[2001::0355:0101:0101]");
++    REQUIRE(bracketed.has_value());
++    CHECK_EQ(bracketed->host, std::string("1.1.1.1"));
++    CHECK_EQ(bracketed->port, std::uint16_t{853});
++
++    const auto maximum = parseIp4pEndpoint("2001::ffff:ffff:ffff");
++    REQUIRE(maximum.has_value());
++    CHECK_EQ(maximum->host, std::string("255.255.255.255"));
++    CHECK_EQ(maximum->port, std::uint16_t{65535});
++}
++
++TEST(ip4p_rejects_invalid_prefix_port_and_text)
++{
++    CHECK(!parseIp4pEndpoint("2002::0355:0101:0101"));
++    CHECK(!parseIp4pEndpoint("2001:db8::1"));
++    CHECK(!parseIp4pEndpoint("2001::0000:0101:0101"));
++    CHECK(!parseIp4pEndpoint("not-an-ip4p-address"));
++    CHECK(!parseIp4pEndpoint(""));
++}
++
++TEST(wireguard_regular_endpoints_are_unchanged)
++{
++    const auto domain = parseWireGuardEndpoint("vpn.example.com:51820");
++    REQUIRE(domain.has_value());
++    CHECK_EQ(domain->host, std::string("vpn.example.com"));
++    CHECK_EQ(domain->port, std::uint16_t{51820});
++    CHECK(!domain->fromIp4p);
++
++    const auto ipv4 = parseWireGuardEndpoint("192.0.2.10:1234");
++    REQUIRE(ipv4.has_value());
++    CHECK_EQ(ipv4->host, std::string("192.0.2.10"));
++    CHECK_EQ(ipv4->port, std::uint16_t{1234});
++
++    const auto ipv6 = parseWireGuardEndpoint("[2001:db8::1]:51820");
++    REQUIRE(ipv6.has_value());
++    CHECK_EQ(ipv6->host, std::string("2001:db8::1"));
++    CHECK_EQ(ipv6->port, std::uint16_t{51820});
++}
++
++TEST(wireguard_rejects_invalid_ports_and_unbracketed_ipv6)
++{
++    CHECK(!parseWireGuardEndpoint("vpn.example.com:0"));
++    CHECK(!parseWireGuardEndpoint("vpn.example.com:65536"));
++    CHECK(!parseWireGuardEndpoint("vpn.example.com:http"));
++    CHECK(!parseWireGuardEndpoint(":51820"));
++    CHECK(!parseWireGuardEndpoint("2001:db8::1"));
++    CHECK(!parseWireGuardEndpoint(""));
++}
+diff --git a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -58,6 +58,7 @@ TEST_BIN     := $(CURDIR)/build/tests/psn_tests
+ TEST_SRC     := $(wildcard $(CURDIR)/tests/*.cpp) \
+                 $(CURDIR)/source/cloud/models.cpp \
+                 $(CURDIR)/source/cloud/library_listing.cpp \
++                $(CURDIR)/source/core/net/wireguard_endpoint.cpp \
+                 $(CURDIR)/source/cloud/game_actions.cpp \
+                 $(CURDIR)/source/cloud/launch_checks.cpp \
+                 $(CURDIR)/source/cloud/start_steps.cpp \
