@@ -1,0 +1,147 @@
+name: Build IP4P release
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even when this upstream and patch release already exists
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '17 2 * * *'
+  push:
+    branches: [master]
+    paths:
+      - .github/workflows/ip4p-release.yml
+      - .github/patches/ip4p-support.patch
+
+permissions:
+  contents: write
+  packages: read
+
+concurrency:
+  group: ip4p-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Checkout automation branch
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync upstream and restore automation files
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUTOMATION_SHA=$(git rev-parse HEAD)
+          PATCH_PATH=.github/patches/ip4p-support.patch
+          WORKFLOW_PATH=.github/workflows/ip4p-release.yml
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream https://github.com/chiaki-ng/akira.git
+          git fetch upstream master
+          git reset --hard upstream/master
+          git checkout "$AUTOMATION_SHA" -- "$PATCH_PATH" "$WORKFLOW_PATH"
+
+          AUTH_HEADER=$(git config --get http.https://github.com/.extraheader)
+          TOKEN_BASE64=${AUTH_HEADER##* }
+          GH_TOKEN=$(printf '%s' "$TOKEN_BASE64" | base64 --decode | cut -d: -f2-)
+          echo "GH_TOKEN=$GH_TOKEN" >> "$GITHUB_ENV"
+
+          UPSTREAM_SHA=$(git rev-parse upstream/master)
+          PATCH_BLOB=$(git rev-parse "$AUTOMATION_SHA:$PATCH_PATH")
+          WORKFLOW_BLOB=$(git rev-parse "$AUTOMATION_SHA:$WORKFLOW_PATH")
+          FINGERPRINT=$(printf '%s\n' "$PATCH_BLOB" "$WORKFLOW_BLOB" | sha256sum | cut -c1-10)
+          RELEASE_TAG="ip4p-${UPSTREAM_SHA::7}-${FINGERPRINT}"
+
+          echo "UPSTREAM_SHA=$UPSTREAM_SHA" >> "$GITHUB_ENV"
+          echo "RELEASE_TAG=$RELEASE_TAG" >> "$GITHUB_ENV"
+          echo "PATCH_PATH=$PATCH_PATH" >> "$GITHUB_ENV"
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Sync upstream master (${UPSTREAM_SHA::7}) [skip ci]"
+            git push origin HEAD:master
+          fi
+
+      - name: Check for an existing release
+        id: release-check
+        shell: bash
+        run: |
+          set -euo pipefail
+          FORCE=$(jq -r '.inputs.force // false' "$GITHUB_EVENT_PATH")
+          if [[ "$FORCE" == "true" ]]; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          elif gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; skipping build"
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply IP4P support patch
+        if: steps.release-check.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git apply --3way "$PATCH_PATH"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Run IP4P unit tests
+        if: steps.release-check.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/tests
+          c++ -std=c++23 -Wall -Wextra -Werror -Iinclude -Itests \
+            tests/test_main.cpp tests/test_wireguard_endpoint.cpp \
+            source/core/net/wireguard_endpoint.cpp \
+            -o build/tests/ip4p_tests
+          ./build/tests/ip4p_tests
+
+      - name: Log in to Container Registry
+        if: steps.release-check.outputs.needed == 'true'
+        shell: bash
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+
+      - name: Set up Docker Buildx
+        if: steps.release-check.outputs.needed == 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build Akira NRO
+        if: steps.release-check.outputs.needed == 'true'
+        shell: bash
+        run: make build CLOUD=false
+
+      - name: Publish NRO release
+        if: steps.release-check.outputs.needed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s build/akira.nro
+          mkdir -p dist
+          cp build/akira.nro dist/akira-ip4p.nro
+          cat > dist/release-notes.md <<EOF
+          Automated build with WireGuard IP4P Endpoint support.
+
+          Upstream: $UPSTREAM_SHA
+          Patch: $PATCH_PATH
+          Artifact: akira-ip4p.nro
+          EOF
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/akira-ip4p.nro --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/akira-ip4p.nro \
+              --title "Akira IP4P ${RELEASE_TAG#ip4p-}" \
+              --notes-file dist/release-notes.md \
+              --prerelease
+          fi
